@@ -2,121 +2,122 @@
 
 ## 0. Assumptions
 
-- One **Hub VPC per region**, one **regional TGW** attached to it. The TGW is shared to other
-  Skylo Org accounts via AWS RAM (hub-and-spoke, not a VPC-peering mesh) and is the single
-  place both Direct Connect (ground stations) and east-west Org traffic land.
-- Ground stations reach us-west-2 over a **DX private VIF → DX Gateway → Transit VIF
-  association to the regional TGW** — this is a private path end to end, no internet transit.
-- The 3GPP core splits into two traffic classes with different needs: **UPF-class** (user
-  plane — high packet-per-second, needs DPDK/SR-IOV/hostNetwork, multiple NICs) and
-  **control-plane class** (AMF/SMF/session/API — standard stateless microservices).
-- A thin **customer-facing dashboard/API** exists and needs a real internet entry point;
-  everything else is private-only. This is the one deliberately public surface.
-- SOC 2 is already in scope org-wide (this doc adds the control mapping relevant to this hub,
-  not a full SOC 2 program).
-- 3 AZs available in us-west-2. Traffic grows, but the initial hub does not need to be
-  hyperscale — I'm designing for "scales cleanly," not for a specific number of devices,
-  since none was given.
+- Two working diagrams back this doc: [`NetworkDesign.jpeg`](./NetworkDesign.jpeg) (network
+  topology — subnets, route tables, TGW, DX/VPN) is authoritative for A1;
+  [`SkyloDesignArchitecture.jpeg`](./SkyloDesignArchitecture.jpeg) (compute + registry-cache
+  view) supplies the ECR/S3 endpoint detail folded into A1/A2. Where the two differ in emphasis,
+  `NetworkDesign.jpeg` wins — it's the later, more complete iteration.
+- One **Hub VPC per region** (`10.100.0.0/16` here), one regional **TGW** (`skylo-ground-tgw`)
+  that is the single place both ground traffic (Direct Connect) and east-west Org traffic land.
+- Ground stations reach us-west-2 over **two diverse 10Gbps Direct Connect circuits** into the
+  TGW, with a **Site-to-Site VPN as backup** if both DX circuits fail. This closes what I'd
+  flagged as the one unaddressed single point of failure in an earlier pass of this design — the
+  diagram already has it, so I'm treating dual-DX + VPN as a hard requirement, not a stretch goal.
+- The 3GPP core splits into two traffic classes with different infra needs: **UPF-class** (user
+  plane — DPDK/SR-IOV/`hostNetwork`, multiple NICs) and **control-plane class** (AMF/SMF/session/
+  API — stateless microservices). The diagram's single "EKS Cluster" box holds both; they're
+  different node groups/taints underneath.
+- The customer dashboard/API (443) is the one deliberately public surface. The diagram's public
+  listener also lists 2152 (GTP-U) — I'm deliberately **not** enabling that by default; see A5.
+- SOC 2 is already in scope org-wide; this doc adds the control mapping relevant to this hub.
+- 3 AZs, matching the diagram. Traffic grows, but I'm designing for "scales cleanly," not a
+  specific device count, since none was given beyond the diagram's own Karpenter/HPA ceilings.
 
 ---
 
 ## A1. Network
 
-### Topology (ASCII)
+**Diagram:** [NetworkDesign.jpeg](./NetworkDesign.jpeg) — subnet tiers, route tables, NAT,
+TGW/DX/VPN. Companion view for the ECR/S3 caching path:
+[SkyloDesignArchitecture.jpeg](./SkyloDesignArchitecture.jpeg).
 
-```
-                              Skylo AWS Organization
-                    ┌───────────────────────────────────────────┐
-                    │   Other accounts (shared svcs, security,   │
-                    │   other regional hubs) — via RAM-shared TGW │
-                    └───────────────┬─────────────────────────────┘
-                                    │  TGW route table: "org-east-west"
- Ground Stations                   │
-      │  DX private VIF            │
-      ▼                            ▼
- ┌─────────────┐    Transit    ┌─────────────────────┐
- │ DX Gateway   │──── VIF ────▶│  Regional TGW         │
- └─────────────┘               │  (2 route tables:     │
-                                │   ground | org-e-w)   │
-                                └──────────┬────────────┘
-                                           │ TGW attachment (1 subnet/AZ)
-                     ┌─────────────────────┴─────────────────────┐
-                     │            Hub VPC  10.30.0.0/16           │
-                     │                                            │
-   AZ-a  ┌───────────┼────────────┐  AZ-b (same tiers)  AZ-c ...  │
-         │ tgw-attach │ 10.30.0.0/24                              │
-         │ private-app│ 10.30.16.0/20  — EKS nodes / UPF pods     │
-         │ private-data│10.30.32.0/20 — ElastiCache, VPC endpoints │
-         │ public-edge│ 10.30.48.0/24 — NAT GW + customer NLB only │
-         └────────────┴────────────┘
-                     │
-                 IGW (public-edge only)
-```
+### Subnet tiers (VPC `10.100.0.0/16`, ×3 AZs)
 
-### Subnet tiers (×3 AZs)
-
-| Tier | Purpose | Internet? |
+| AZ | Public subnet | Private subnet |
 |---|---|---|
-| `tgw-attach` | TGW ENI per AZ | No |
-| `private-app` | EKS worker nodes, UPF + control-plane pods | No (NAT for egress only) |
-| `private-data` | ElastiCache, interface VPC endpoints (ECR, S3, STS, CloudWatch) | No |
-| `public-edge` | NAT Gateway (1/AZ) + the one customer-facing NLB | Yes, via IGW |
+| us-west-2a | `10.100.0.0/24` | `10.100.10.0/24` |
+| us-west-2b | `10.100.1.0/24` | `10.100.20.0/24` |
+| us-west-2c | `10.100.2.0/24` | `10.100.30.0/24` |
 
-Route tables are per tier, per AZ: private tiers default-route to that AZ's own NAT Gateway
-(never a shared cross-AZ NAT — that's a single point of failure disguised as a cost saving),
-plus a static route for ground and Org CIDRs pointed at the TGW attachment. The public-edge
-table routes `0.0.0.0/0` to the IGW and nothing else.
+- **Public** — NAT Gateway (1/AZ) and the customer-facing NLB only. Nothing else lives here.
+- **Private** — EKS worker nodes (Karpenter, 3–100/AZ), the TGW attachment ENI, and the ECR
+  interface endpoint. No public IPs; egress via NAT, ground/Org reachability via TGW.
+- **Pods** get their addresses from a **secondary, non-RFC1918 CIDR** (`100.64.0.0/10`, RFC 6598
+  — I'd associate a concrete `100.64.0.0/16` slice of it) via VPC CNI custom networking + prefix
+  delegation, not from the primary `/16`. This is what lets HPA scale pods 10→1,000/AZ without
+  ever touching primary-subnet IP budget: node count and pod count scale on two separate address
+  spaces, deliberately.
 
-**TGW route tables are split in two**, not one flat table: a `ground` route table (DX-origin
-traffic only reaches the subnets that need it) and an `org-east-west` route table (Org
-accounts see only what's explicitly shared). This is the actual security control here —
-segmentation at the TGW, not just "everything's in a VPC so it's fine."
+Two sizing/placement calls worth stating out loud, not just reading off the diagram:
+- **TGW attachment shares the private subnets** rather than a dedicated `tgw-attach` tier — one
+  fewer subnet type to operate. Trade-off: a dedicated tier gives cleaner route-table blast-radius
+  separation. I'd add it the day a security review asks for it, not before.
+- **Private subnets are `/24`, sized against the diagram's own stated ceiling.** Karpenter caps
+  at 100 nodes/AZ; a `/24` gives 251 usable IPs/AZ, which covers that with real headroom (node
+  ENIs + TGW ENI + interface-endpoint ENIs). I wouldn't draw it smaller — AWS subnets don't resize
+  in place, so under-sizing here is a second migration later, not a quick fix.
 
-### CIDR strategy
+### Route tables
 
-- Central **IPAM** (or at minimum a spreadsheet acting as one, day one) owns a supernet per
-  continent, e.g. `10.16.0.0/12` for Americas hubs. Each regional hub is allocated a fixed
-  `/16` sequentially out of that block — us-west-2 gets `10.30.0.0/16` here.
-- Hubs **do not get routes to each other by default.** A new hub is just a new non-overlapping
-  `/16` plus a new TGW attachment to the shared TGW (or its own TGW peered up); it never has to
-  negotiate CIDR space with an existing hub because the allocation is centrally reserved before
-  the VPC is created. That's what actually prevents collisions as Skylo adds hubs — not
-  discipline at build time, but the range being spoken for in advance.
-- Subnets are sized generously (`/20`–`/24`) with room to add a 4th AZ or split a tier later
-  without re-carving the VPC.
+- **Public** — one shared table across all 3 AZs: `0.0.0.0/0 → IGW`. Nothing else.
+- **Private** — one table **per AZ**, never a shared cross-AZ table: default route to that AZ's
+  *own* NAT Gateway, a route to `10.200.0.0/16` (ground) and Org CIDRs via the TGW attachment, and
+  the S3 prefix-list route to the S3 Gateway endpoint. Own-AZ NAT only — a shared NAT across AZs
+  is a cost optimization that quietly becomes a single point of failure, which fails "resilient to
+  single-AZ failure" outright.
+
+### Transit Gateway (`skylo-ground-tgw`)
+
+- Carries the ground attachment today — `10.200.0.0/16`, over dual DX circuits with the VPN
+  backup — and this VPC's attachment.
+- **Extending the diagram:** the take-home also asks this attachment to carry east-west Org
+  traffic, which isn't drawn yet. I'd add that as a **second, RAM-shared TGW route table**,
+  separate from the ground route table — so a misbehaving Org account can't see ground-station
+  traffic and vice versa. The segmentation is a TGW-level control, not "it's all in one VPC so
+  it's fine."
+
+### CIDR strategy — and how it avoids collisions as Skylo adds hubs
+
+- A central IPAM allocates a fixed `/16` per hub, sequentially, from a reserved supernet —
+  `10.100.0.0/16` is hub #1's VPC space; hub #2 gets `10.101.0.0/16`, and so on. The ground/on-prem
+  side gets identical treatment from a **separate** reserved supernet (`10.200.0.0/16` is hub #1's
+  ground segment). Two supernets, not one, so hub-VPC space and ground space can't collide with
+  each other either.
+- What actually prevents collisions is the range being **reserved in IPAM before the VPC exists**
+  — not naming discipline at build time.
+- The pod secondary CIDR is the one range exempt from this: prefix-delegated pod IPs never cross
+  the TGW (cluster-local only), so every hub can safely reuse the *same* `100.64.0.0/16` slice
+  without burning central IPAM budget on it. Worth stating explicitly so nobody "fixes" this later.
 
 ---
 
 ## A2. Compute
 
-**Decision: EKS.**
+**Decision: EKS**, with **Karpenter** for node autoscaling (3–100 nodes/AZ) and **HPA** for pod
+autoscaling (10–1,000 pods/AZ) — matching what the diagram already commits to.
 
-Justification against the actual workload, not compute in the abstract:
+- UPF-class pods need DPDK/SR-IOV, `hostNetwork`, and often a second/third NIC via Multus — EKS
+  lets me run a custom CNI and SR-IOV device plugins as DaemonSets. ECS's networking model doesn't
+  expose that layer on either launch type (Fargate or EC2).
+- **Karpenter specifically, not cluster-autoscaler:** it provisions against the actual
+  pending-pod resource shape instead of a fixed ASG shape — it matters here because UPF nodes and
+  control-plane nodes want different instance types (network-optimized vs general compute), and a
+  fixed ASG per type is exactly the rigidity Karpenter removes.
+- Telco-core vendor software ships as Helm charts/Operators with CRDs, not ECS task definitions —
+  fighting the ecosystem's packaging format is its own tax.
+- Portability: Kubernetes travels if the same core stack needs to run at the edge or a second
+  cloud later; ECS task definitions don't.
 
-- UPF-class pods need DPDK/SR-IOV, `hostNetwork`, and typically a second/third NIC via Multus
-  — that requires controlling the CNI stack and kubelet device plugins. EKS lets me run a
-  custom CNI (VPC CNI + Multus, or swap to Cilium) and SR-IOV device plugins as DaemonSets.
-  ECS does not expose this layer — not on Fargate, and not meaningfully on EC2 launch type
-  either, since ECS's networking model doesn't support attaching multiple pod-level ENIs with
-  custom drivers.
-- Telco-core vendor software (Open5GS/free5GC-style cores, and most commercial 3GPP vendors)
-  ships as Helm charts / Kubernetes Operators with CRDs, not ECS task definitions. Fighting the
-  packaging format the ecosystem ships in is its own tax.
-- Portability: if Skylo ever needs the same core stack to run at the edge or on a second cloud,
-  Kubernetes travels; ECS task definitions don't.
+**Cost, stated honestly:** EKS is a heavier operational surface — control-plane version upgrades,
+add-on management (CoreDNS, VPC CNI + prefix-delegation config, Karpenter, cert-manager), a real
+on-call skill requirement that ECS mostly hides. Accepting that because the workload's networking
+needs make it non-negotiable, not because Kubernetes is fashionable.
 
-**What this costs, honestly:** EKS is a heavier operational surface — control plane version
-upgrades, add-on management (CoreDNS, CNI, Karpenter/cluster-autoscaler, cert-manager,
-ingress), and a real on-call skill requirement that ECS mostly hides. I'm accepting that
-overhead because the workload's networking requirements make it non-negotiable, not because
-Kubernetes is fashionable.
-
-**What would make me reverse this:** if the region-1 scope turned out to be **only the
-stateless control-plane services** (AMF/SMF/API, no DPDK, no hostNetwork) with UPF staying
-centralized elsewhere — i.e., if "core network processing" here didn't actually include the
-user-plane workload — I'd run that slice on ECS on Fargate and cut the operational overhead
-substantially. The requirement that reverses the decision is specifically *"does this hub run
-the packet-processing UPF, or only session/control logic."*
+**What would reverse this:** if this hub's scope turned out to be **only the stateless
+control-plane services** (AMF/SMF/API — no DPDK, no `hostNetwork`) with UPF centralized elsewhere,
+I'd run that slice on ECS/Fargate and drop the operational overhead substantially. The reversing
+question is specifically *"does this hub run the packet-processing UPF, or only session/control
+logic."*
 
 ---
 
@@ -124,86 +125,99 @@ the packet-processing UPF, or only session/control logic."*
 
 | Need | Service | Why |
 |---|---|---|
-| Short-term session state (high throughput, low latency) | **ElastiCache (Redis/Valkey), cluster mode, multi-AZ** | In-memory reads for UPF/session lookups, native TTL for session expiry, and multi-AZ replication gives failover without the application handling it. |
-| Long-term archival of connection logs | **S3, Standard → Intelligent-Tiering/Glacier lifecycle, Object Lock enabled** | Durable and cheap at the volume connection logs accumulate to; Athena/Glue query it directly for SOC 2 evidence pulls; Object Lock gives the immutability auditors ask for without a second product. |
+| Short-term session state (high throughput, low latency) | **ElastiCache (Redis/Valkey), cluster mode, multi-AZ** | In-memory reads for UPF/session lookups, native TTL for session expiry, multi-AZ replication gives failover without app-level handling. |
+| Long-term archival of connection logs | **S3, Standard → Intelligent-Tiering/Glacier lifecycle, Object Lock** | Durable and cheap at connection-log volume; Athena/Glue queries it directly for SOC 2 evidence pulls; Object Lock gives auditors immutability without a second product. |
+
+Worth distinguishing: the diagram's other S3 bucket is a **container-image layer cache** (ECR
+pulls routed via the S3 Gateway endpoint, avoiding NAT egress cost/hops for image pulls) — a
+different, much smaller bucket than the connection-log archive above. Same service, two unrelated
+jobs; one lifecycle/retention policy should not govern both.
 
 ---
 
 ## A4. HA and DR
 
-**Single-AZ loss:** every stateful and stateless component is 3-AZ by default — EKS nodes
-spread across AZs (topology spread constraints + PodDisruptionBudgets so a drain doesn't take
-a whole service down), NAT Gateway per AZ, ElastiCache multi-AZ with automatic failover, and
-the customer NLB is cross-zone. Each AZ's node group is sized so it runs at roughly ≤65-70% of
-its own capacity at steady state — losing one AZ pushes the remaining two to full but not over,
-so failover doesn't turn an AZ outage into a capacity outage.
+**AZ loss:** every stateful/stateless component is 3-AZ by default — Karpenter node groups spread
+across AZs (topology spread constraints + PodDisruptionBudgets, so a drain doesn't take a service
+down), NAT Gateway per AZ, ElastiCache multi-AZ with automatic failover, NLB cross-zone. Each AZ
+runs at ≤65–70% of its own capacity at steady state, so losing one AZ pushes the remaining two to
+full, not over — failover doesn't turn an AZ outage into a capacity outage.
 
-**Region loss (all of us-west-2 gone):** I'm treating this as a hub tied to physical ground
-infrastructure in that region — devices connecting to satellites serving this continent can't
-transparently fail over to a hub on another continent without materially worse latency, and
-possibly a data-residency conversation. So this is **warm-standby, not active-active**:
+**Ground-link loss:** dual Direct Connect circuits into the TGW, Site-to-Site VPN as backup if
+both fail — this is the diagram closing what was previously this design's one unaddressed single
+point of failure (a single DX location). Worth confirming in review that the two DX circuits
+terminate at physically diverse facilities, not just diverse ports at the same one — logical
+redundancy on top of a shared physical failure domain isn't real redundancy.
 
-- Infra is IaC, so a second region can be stood up from the same Terraform.
-- S3 cross-region replication for connection-log archives; ElastiCache backups restorable in
-  the standby region.
-- Target **RTO ~2–4 hours** (re-provision EKS + core via Terraform, restore state, re-point DX
-  or fail ground traffic to a backup path), **RPO ~5–15 minutes** (bounded by async
-  replication lag).
-- Cost trade-off, stated explicitly: true active-active would push RTO toward zero but roughly
-  doubles steady-state infrastructure spend and adds the operational cost of keeping two live
-  core stacks continuously in sync. I wouldn't default to that without a specific SLA from
-  Skylo that requires it — this is a judgment call, not a technical limitation.
+**Region loss (all of us-west-2 gone):** this hub is tied to physical ground infrastructure
+in-region — devices reaching this continent's ground stations can't transparently fail over to a
+hub on another continent without materially worse latency, and possibly a data-residency
+conversation. So this is **warm standby, not active-active**:
+
+- Infra is IaC, so a second region stands up from the same Terraform.
+- S3 cross-region replication for log archives; ElastiCache backups restorable in the standby
+  region.
+- Target **RTO ~2–4 hours** (re-provision EKS + core, restore state, re-point DX or fail ground
+  traffic to a backup path), **RPO ~5–15 minutes** (bounded by async replication lag).
+- Named trade-off: active-active pushes RTO toward zero but roughly **doubles steady-state spend**
+  and adds the burden of keeping two live core stacks continuously in sync. Not adopting that by
+  default without a specific SLA from Skylo that requires it — a judgment call, not a technical
+  limitation.
 
 ---
 
 ## A5. Security and Observability
 
-**IAM role model:** IRSA (or EKS Pod Identity) — every workload gets its own IAM role scoped to
-exactly what it calls, not the node's instance role. Deliberately withheld from workload roles:
+**IAM role model:** IRSA (or EKS Pod Identity) — every workload gets its own role scoped to
+exactly what it calls, never the node's instance role. Deliberately withheld from workload roles:
 
 - Any wildcard (`*`) action or resource.
 - `iam:PassRole` / `iam:CreateRole` — workloads never mint or hand off identity.
-- Ability to modify security groups, route tables, or TGW attachments — network is
-  platform-owned, not app-owned. This is the actual separation-of-duties control: a compromised
-  pod can't widen its own network access.
-- Cross-account `sts:AssumeRole` beyond the one or two specific roles a service actually needs.
+- Rights to modify security groups, route tables, or TGW attachments — network stays
+  platform-owned; a compromised pod can't widen its own network access.
+- Cross-account `sts:AssumeRole` beyond the one or two roles a service actually needs.
 
-**First 3 AWS security services, in this order:**
+**The SG model, tied to the diagram:** `sg-nlb-public` is the *only* internet-facing security
+group in the hub. `sg-eks-private` (EKS nodes) allows inbound only from `sg-nlb-public`'s ID and
+the ground/Org CIDRs via TGW — never a `0.0.0.0/0` rule on EKS itself. **One deliberate change
+from the diagram:** the public listener also lists 2152/GTP-U — I'd keep that **off by default**
+and DX-only, since unauthenticated GTP-U on the open internet is a known telco anti-pattern. I'd
+only enable it for a genuine non-DX device path (e.g., a roaming/interconnect partner), and even
+then behind IPsec, not a bare UDP listener.
 
-1. **AWS Config** — turned on first because it's the evidence engine: continuous resource
-   recording plus managed rules is most of what a SOC 2 auditor actually asks to see, and it
-   also catches config drift from the IaC baseline.
-2. **GuardDuty** — VPC Flow Logs / DNS / CloudTrail / EKS audit log threat detection with
-   essentially no setup cost; this is the "did something bad actually happen" signal Config
-   doesn't give you.
-3. **Security Hub** — aggregates Config + GuardDuty (+ Inspector once workloads are running)
-   into one prioritized view mapped to CIS/AWS FSBP, so there's one dashboard instead of three
-   consoles nobody checks.
+**First 3 AWS security services, in order:**
+
+1. **AWS Config** — the evidence engine: continuous resource recording + managed rules is most of
+   what a SOC 2 auditor asks to see, and it catches IaC drift from the baseline.
+2. **GuardDuty** — VPC Flow Logs/DNS/CloudTrail/EKS audit log threat detection with near-zero
+   setup cost; the "did something bad actually happen" signal Config doesn't give.
+3. **Security Hub** — aggregates Config + GuardDuty (+ Inspector once workloads run) into one
+   CIS/AWS-FSBP-mapped view, instead of three consoles nobody checks.
 
 **Top 3 metrics to alert on:**
 
-1. Pod crash-loop / OOMKilled rate — earliest signal something is actually broken, not just
-   slow.
-2. P99 session-processing latency (GTP-U path latency for UPF specifically, request latency for
-   control-plane services) — this is the end-user-facing signal; devices don't care that the
-   cluster is "up," they care whether sessions are timing out.
-3. Scheduling/capacity saturation — pending pods and per-AZ node CPU/memory pressure. For a
-   telco core, this metric predicts dropped sessions before they happen, so it's the
-   early-warning one, not a lagging indicator.
+1. Pod crash-loop/OOMKilled rate — earliest signal something is actually broken, not just slow.
+2. P99 session-processing latency (GTP-U path for UPF, request latency for control-plane) —
+   devices don't care the cluster is "up," they care whether sessions time out.
+3. Scheduling/capacity saturation — pending pods, per-AZ node CPU/memory. For a telco core this
+   predicts dropped sessions before they happen. The ceiling this metric is really watching for
+   isn't node count — Karpenter handles that — it's **NAT Gateway throughput and ElastiCache
+   connection/CPU limits**, neither of which autoscales on its own.
 
-**Logging/monitoring stack (one call, not a survey):** Prometheus (via Amazon Managed
-Prometheus) + Grafana for Kubernetes-native metrics and dashboards, Fluent Bit shipping
-container and VPC Flow logs to OpenSearch for the SOC 2-retention audit trail and ad hoc
-investigation. CloudWatch stays as the AWS-service-level signal (NAT, TGW, ElastiCache metrics)
-rather than trying to force every signal through one tool.
+**Logging/monitoring stack, one call:** Prometheus (Amazon Managed Prometheus) + Grafana for
+Kubernetes-native metrics and dashboards; Fluent Bit shipping container and VPC Flow Logs to
+OpenSearch for the SOC 2-retention audit trail and ad hoc investigation; CloudWatch stays for
+AWS-service-level signals (NAT, TGW, ElastiCache) rather than forcing every signal through one
+tool.
 
 ---
 
 ## What I'd do next with more time
 
-- Model actual expected packet/session rates to size node groups and ElastiCache instead of
-  reasoning qualitatively.
-- Decide the DX resiliency story explicitly (single DX location is a real single point of
-  failure that this doc hasn't sized a fix for — second DX location or VPN backup).
-- Threat-model the customer-facing NLB path specifically, since it's the one deliberately
-  public surface.
+- Model actual packet/session rates to size node groups, NAT Gateway bandwidth, and ElastiCache
+  instead of reasoning qualitatively.
+- Confirm the two DX circuits are physically diverse (different facilities/providers), not just
+  logically redundant.
+- Threat-model the customer-facing NLB path specifically — it's the one deliberately public
+  surface, and the one place I overrode the diagram outright (dropping public GTP-U) rather than
+  just describing what's drawn.
