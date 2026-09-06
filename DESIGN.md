@@ -164,6 +164,7 @@ conversation. So this is **warm standby, not active-active**:
   default without a specific SLA from Skylo that requires it — a judgment call, not a technical
   limitation.
 
+- **Cache-only middle ground:** ElastiCache (Redis/Valkey) Global Datastore gives real-time cross-region replication (sub-second lag) for session state specifically, without touching anything else in the stack — the extra spend is scoped to a second live cache cluster, not a second live core stack. This tightens session-state RPO close to zero without paying the full active-active tax across EKS/network/etc. I'd adopt it if Skylo needs session continuity across a region loss specifically; not defaulting to it because nothing else in the path is real-time-replicated, so overall RTO stays dominated by EKS/network re-provisioning regardless — a faster cache alone doesn't move the number that matters.
 ---
 
 ## A5. Security and Observability
