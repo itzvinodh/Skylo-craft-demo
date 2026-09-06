@@ -1,6 +1,6 @@
 ############################################################################
 # Skylo Regional Hub — Foundational Network (us-west-2)
-#
+# This is only 
 # Scope of this file: VPC, subnets, route tables, IGW, NAT, and the TGW
 # attachment only. Matches DESIGN.md A1 exactly: 10.100.0.0/16 hub VPC,
 # 10.200.0.0/16 ground segment, public/private tiers x3 AZ. Per the
