@@ -39,23 +39,18 @@ applied throughout `vpc.tf` and repeated here.
 
 ---
 
-## Variables — and the one fix that matters
+## Variables
 
 `vpc.tf` declares `hub_cidr` (`10.100.0.0/16`), `pod_secondary_cidr`
-(`100.64.0.0/16`), `ground_cidr` (`10.200.0.0/16`), and `org_cidrs`. The first
-three are correct as written and match `NETWORK-DESIGN.md`'s CIDR strategy
-exactly.
+(`100.64.0.0/16`), `ground_cidr` (`10.200.0.0/16`), and `org_cidrs`
+(`172.16.0.0/12`) — all four consistent with `NETWORK-DESIGN.md`'s
+three-address-family CIDR strategy.
 
-**`org_cidrs` needs a corrected default.** An earlier draft used
-`10.96.0.0/11` as a placeholder — which, checked against the actual range
-(`10.96.0.0/11` spans `10.96.0.0–10.127.255.255`), **overlaps `10.100.0.0/16`**,
-the hub's own VPC CIDR. AWS's implicit local-route precedence means this
-wouldn't have actually broken routing, but it directly contradicts the "avoids
-collisions as Skylo adds hubs" claim the design makes elsewhere, and it's exactly
-the kind of thing an interviewer checks by hand.
-
-Corrected block, consistent with `NETWORK-DESIGN.md`'s three-address-family
-scheme:
+`org_cidrs` is deliberately sourced from a **different RFC1918 block**
+(`172.16.0.0/12`) than `hub_cidr`/`ground_cidr` (both drawn from `10.0.0.0/8`).
+That's not an arbitrary choice: it's what makes org-account space structurally
+unable to collide with hub or ground space as Skylo adds more hubs, rather than
+relying on IPAM bookkeeping to keep three ranges apart by convention.
 
 ```hcl
 variable "org_cidrs" {
@@ -66,8 +61,8 @@ variable "org_cidrs" {
 ```
 
 Everything downstream that consumes `org_cidrs` (the `aws_route.private_to_org`
-resource, keyed per-AZ-per-CIDR) is unaffected by this fix — it already treats
-`org_cidrs` as an opaque list, so correcting the default is a one-line change.
+resource, keyed per-AZ-per-CIDR) treats it as an opaque list, so adding a
+second org CIDR later is a one-line change.
 
 ---
 

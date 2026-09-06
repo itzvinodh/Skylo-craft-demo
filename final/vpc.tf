@@ -90,13 +90,10 @@ variable "ground_cidr" {
 # segmentation enforcement is the TGW route table, out of scope for this
 # file.
 #
-# FIX: an earlier draft defaulted this to 10.96.0.0/11, which actually
-# overlaps hub_cidr (10.96.0.0/11 spans 10.96.0.0-10.127.255.255, and
-# 10.100.0.0/16 falls inside it). Org accounts now come from 172.16.0.0/12
-# instead — a different RFC1918 block entirely, not a sub-range of the
-# 10.0.0.0/8 space hub_cidr/ground_cidr are drawn from — so no amount of
-# hub growth can ever collide with org space. See vpc.md for the full
-# writeup of this fix.
+# Sourced from 172.16.0.0/12 — a different RFC1918 block entirely, not a
+# sub-range of the 10.0.0.0/8 space hub_cidr/ground_cidr are drawn from —
+# so no amount of hub growth can ever collide with org space. See vpc.md
+# for the full CIDR-strategy writeup.
 variable "org_cidrs" {
   type    = list(string)
   default = ["172.16.0.0/12"]

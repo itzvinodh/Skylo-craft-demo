@@ -91,13 +91,10 @@ and ground segments are two halves of the same `/8` (`10.0.0.0/9` vs
 `10.128.0.0/9`) — deliberately chosen so neither range can ever grow into the
 other. Org accounts sit in a *different* RFC1918 block altogether
 (`172.16.0.0/12`), so no amount of hub growth can ever collide with org space
-either. An earlier draft of this scheme used `10.96.0.0/11` as a placeholder for
-org CIDRs — which, on inspection, actually **overlaps** `10.100.0.0/16` (both fall
-inside `10.96.0.0–10.127.255.255`). That's exactly the class of bug this
-three-family structure is designed to make structurally impossible rather than
-something a spreadsheet has to keep tracking correctly. Adding hub #37 tomorrow
-cannot collide with any existing hub's ground segment or any org account, by
-construction.
+either. That's a structural property, not a naming convention someone has to
+keep enforcing correctly — the three families simply can't grow into each
+other. Adding hub #37 tomorrow cannot collide with any existing hub's ground
+segment or any org account, by construction.
 
 ---
 
@@ -147,9 +144,8 @@ end-to-end number — the ground backhaul and the customer's internet path — i
 determined by geography and terrestrial/last-mile links, not by anything this
 design can shorten. These figures are stated as **order-of-magnitude engineering
 estimates from AWS's published component characteristics, not benchmarked
-numbers** — the same distinction this repo's `reference/README.md` already flags
-about an earlier round of fabricated-looking latency figures, and worth repeating
-out loud if an interviewer asks "where does that number come from."
+numbers** — worth saying explicitly if an interviewer asks "where does that
+number come from."
 
 ---
 
